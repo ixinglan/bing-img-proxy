@@ -1,0 +1,18 @@
+services:
+  bing-img-proxy:
+    build: .
+    # 锁死目标平台，避免在本机(ARM64 Mac)构建时把 ARM 版二进制打进镜像，
+    # 导致在 x86_64 云服务器上启动报 "exec format error"。
+    # 若云服务器本身是 ARM64(aarch64)，请改成 linux/arm64。
+    platform: linux/amd64
+    image: bing-img-proxy:latest
+    ports:
+      - "18088:18088"
+    volumes:
+      # 挂载配置目录：改 image_ids.txt / origins.txt 无需重建镜像
+      - ./config:/app/config:ro
+    environment:
+      - ROUTE_PATH=/api/bg/random
+      - BING_BASE_URL=https://cn.bing.com/th?id=
+      # CONFIG_DIR 默认 /app/config，一般情况无需修改
+    restart: unless-stopped

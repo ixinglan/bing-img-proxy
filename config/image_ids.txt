@@ -1,0 +1,19 @@
+# Bing 每日壁纸图片标识 id，每行一个（换行区分多个）
+# 该 id 是 https://cn.bing.com/th?id=<这里> 中 <这里> 的部分
+# 获取方式：打开 cn.bing.com，浏览器开发者工具里看背景图请求的 th?id= 后面的字符串
+# 下面是示例占位，请替换成你自己要用的 id（删掉 # 行不会生效）
+
+OHR.MaraCrossing_ZH-CN8816902094_1920x1080.webp
+OHR.BoatsMalta_ZH-CN4708255775_1920x1080.jpg
+OHR.HelsinkiBlue_ZH-CN3961551568_1920x1080.jpg
+OHR.HawaiiLava_ZH-CN3257621771_1920x1080.jpg
+OHR.VirginiaTrail_ZH-CN2299501599_1920x1080.jpg
+OHR.NavajoNation_ZH-CN9274387505_1920x1080.jpg
+OHR.LimeKiln_ZH-CN5664152522_1920x1080.avif
+OHR.JMTjibaou_ZH-CN6992670356_1920x1080.avif
+OHR.SandPath_ZH-CN7820825668_1920x1080.avif
+OHR.ColorfulCop_ZH-CN8015611442_1920x1080.avif
+OHR.BoatsMalta_ZH-CN4708255775_1920x1080.webp
+OHR.HelsinkiBlue_ZH-CN3961551568_1920x1080.webp
+OHR.HawaiiLava_ZH-CN3257621771_1920x1080.webp
+OHR.VirginiaTrail_ZH-CN2299501599_1920x1080.webp

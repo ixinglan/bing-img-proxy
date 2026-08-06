@@ -1,0 +1,10 @@
+# 允许访问的来源白名单（Referer / Origin 校验），每行一个
+# 留空（本文件无内容）= 开放模式，允许任何来源
+# 支持通配子域：*.example.com 可匹配 https://a.example.com / https://b.example.com
+# 注意写完整的 origin（含协议），例如 https://your-site.com
+
+# https://blog.zhaojq.top/
+# https://zhaojq.top/
+# https://www.zhaojq.top/
+# http://localhost:1313/
+# http://localhost:8080/
