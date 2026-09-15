@@ -12,6 +12,7 @@ bing-img-proxy
     ROUTE_PATH     对外随机图路径，默认 /
 """
 import os
+import hashlib
 import secrets
 from urllib.parse import urlparse
 
@@ -135,7 +136,16 @@ def handle_random(request: Request) -> RedirectResponse:
     if not origin_allowed(req_origin, loader.origins):
         raise HTTPException(status_code=403, detail="origin not allowed")
 
-    img_id = secrets.choice(loader.image_ids)
+    # 若携带 seed 则确定性选图：同一 seed 永远映射到同一张图（用于前端缓存背景，
+    # 只在用户点击「刷新背景」时换 seed），否则保持原有随机行为。
+    seed = request.query_params.get("seed")
+    ids = loader.image_ids
+    if seed:
+        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+        img_id = ids[int(digest, 16) % len(ids)]
+    else:
+        img_id = secrets.choice(ids)
+
     url = f"{BING_BASE_URL}{img_id}"
     # 防缓存：每次都随机，不被浏览器 / CDN 缓存
     return RedirectResponse(
