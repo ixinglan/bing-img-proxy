@@ -40,15 +40,15 @@ docker compose up -d --build
 验证：
 
 ```bash
-curl -i http://localhost:18088/          # 期望 302
-curl -i http://localhost:18088/?seed=abc # 期望 302，且 seed 相同则目标稳定不变
+curl -i http://localhost:18088/api/random          # 期望 302
+curl -i http://localhost:18088/api/random?seed=abc # 期望 302，且 seed 相同则目标稳定不变
 curl -i http://localhost:18088/api/bg/health  # {"status":"ok","image_count":N}
 ```
 
 前端里这样用：
 
 ```html
-<img src="https://your-domain.com/?seed=abc123" alt="wallpaper" />
+<img src="https://your-domain.com/api/random?seed=abc123" alt="wallpaper" />
 ```
 
 ## 配置
@@ -86,6 +86,52 @@ curl -i http://localhost:18088/api/bg/health  # {"status":"ok","image_count":N}
 | `302` | 正常，重定向到随机壁纸 |
 | `403` | 来源不在白名单 |
 | `503` | 图片 id 列表为空 |
+
+## 图片池接口（推荐用于「背景不白屏」场景）
+
+`/api/bg/random` 是 **302 重定向**，浏览器每次整页导航都要重走一趟重定向再下载图片；
+在 Hugo 这类多页站点上切换页面时，会出现「白屏 → 背景加载」的闪烁（且重定向响应带 `no-store`，
+浏览器无法缓存，每次导航都重新下载）。
+
+为此新增接口 **`GET /api/bg/image`**（默认路径，可用 `POOL_ROUTE_PATH` 改）：
+
+- **直接返回图片字节**（同源，不再是 302），响应带
+  `Cache-Control: public, max-age=86400, immutable`，浏览器会本地缓存；
+- **URL 稳定**（前端按 `?seed=` 生成同一个 URL）→ 切换页面命中浏览器缓存、不再回源，**零白屏**；
+- **服务端图片池**：预先保留若干张（默认 5 张）已下载好的图片，请求时**直接从本地磁盘取**，
+  取走一张后**立刻在后台异步补一张**，始终保持 5 张就绪，避免实时回源 Bing 的等待。
+
+「取 1 补 1」的效果：
+
+```
+第 1 次请求：从池中取 1 张秒回 → 剩 4 张 → 后台异步补 1 张 → 回到 5 张
+第 2 次请求：取缓存 → 剩 4 张 → 再异步补 1 张 → 共 5 张
+...以此类推
+```
+
+验证：
+
+```bash
+curl -i "http://localhost:18088/api/bg/image?seed=abc"   # 200 + image/webp|jpeg|avif + Cache-Control
+curl -s "http://localhost:18088/api/bg/pool"             # {"pool_size":5,"ready":5}
+```
+
+图片缓存落在 `CACHE_DIR`（默认 `cache/`），文件名为 `<sha1(id)>.img` / `<sha1(id)>.type`；
+多个 gunicorn worker 共享同一份磁盘缓存，容器重启后仍可复用
+（建议把该目录挂载到宿主机，`docker-compose.yml` 已配好）。
+
+新增环境变量：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `POOL_ROUTE_PATH` | `/api/bg/image` | 图片池接口路径 |
+| `POOL_SIZE` | `5` | 服务端预留的就绪图片张数 |
+| `CACHE_DIR` | `cache` | 图片磁盘缓存目录（容器内为 `/app/cache`） |
+| `POOL_CACHE_MAX_AGE` | `86400` | 返回给浏览器的缓存秒数（1 天） |
+| `DOWNLOAD_TIMEOUT` | `10` | 回源下载超时秒数 |
+| `UPSTREAM_USER_AGENT` | 内置浏览器 UA | 回源时的 User-Agent |
+
+> 与原接口的关系：`/api/bg/random` **完全保持不变**（仍 302、仍 `no-store`）。新老接口并存。
 
 ## 构建镜像
 

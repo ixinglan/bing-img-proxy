@@ -11,8 +11,14 @@ services:
     volumes:
       # 挂载配置目录：改 image_ids.txt / origins.txt 无需重建镜像
       - ./config:/app/config:ro
+      # 挂载图片池磁盘缓存：容器重建/重启后已下载的图片仍可复用，无需重新回源
+      - ./cache:/app/cache
     environment:
       - ROUTE_PATH=/api/bg/random
       - BING_BASE_URL=https://cn.bing.com/th?id=
+      # 图片池接口（/api/bg/image）：预留就绪张数 + 浏览器缓存时长（秒）
+      - POOL_SIZE=5
+      - POOL_CACHE_MAX_AGE=86400
+      # POOL_ROUTE_PATH 默认 /api/bg/image，一般无需修改
       # CONFIG_DIR 默认 /app/config，一般情况无需修改
     restart: unless-stopped

@@ -29,3 +29,6 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+# 图片池磁盘缓存（运行时生成，不入库）
+cache/
