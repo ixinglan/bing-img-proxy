@@ -39,7 +39,10 @@ bing-img-proxy
        2560x1440 仍需放大 1.36 倍   -> 仍略虚
        3200x1800 需放大 1.09 倍     -> 临界
        3840x2160 是缩小 0.91 倍     -> 清晰，且能覆盖到 4K 屏
-     若你的访客以手机为主，可把 BING_IMAGE_PARAMS 调小以省流量（手机视口小得多）。
+     默认 BING_IMAGE_PARAMS 为空 = 取原图（最清晰，但流量最大）。
+     若要省流量，自行设置缩图参数；背景是 cover 铺满视口，需要「视口 CSS 尺寸 x DPR」
+     个设备像素，1080p 在 Retina 上会被放大 1.5 倍以上而发虚，故建议给足尺寸。
+     实测 3840x2160 时 1.13MB（原图 3.68MB），肉眼看不出画质差异，耗时也几乎不变。
 
   4) 失败必须兜底：单个 id 回源失败（Bing 侧已失效 / 瞬时抖动）不能让背景空着。
      策略是「重试 → 校验 → 失败则换一张能用的图」，并把反复失败的 id 临时拉黑。
@@ -56,7 +59,7 @@ bing-img-proxy
     CACHE_DIR            图片磁盘缓存目录，默认 cache
     CACHE_MAX_FILES      磁盘缓存文件对数上限（LRU），默认 POOL_SIZE*4（=20）
                          设为 0 表示不限制；过小会被自动抬到「保护集合」之上
-    BING_IMAGE_PARAMS    回源缩图参数，默认 w=1920&h=1080&c=7&rs=1；置空则取原图
+    BING_IMAGE_PARAMS    回源缩图参数，默认空=取原图；如 w=3840&h=2160&c=7&rs=1
     RESIZE_ON_REDIRECT   是否让「原 302 接口」也缩图，默认 0（不改动原接口）
     POOL_CACHE_MAX_AGE   返回给浏览器的缓存秒数，默认 86400（1 天）
     DOWNLOAD_TIMEOUT     回源下载超时秒数，默认 10
@@ -150,17 +153,16 @@ BING_BASE_URL = os.getenv("BING_BASE_URL", "https://cn.bing.com/th?id=").rstrip(
 # lstrip("&?") 是为了容错：有人习惯把参数写成 "?w=100" 或 "&w=100"，
 # 若只去掉 "&"，"?w=100" 会拼出 "...jpg&?w=100" 这种畸形 URL。
 #
-# 默认取 3840x2160 而不是 1920x1080：背景是 cover 铺满视口，需要
-# 「视口 CSS 尺寸 x DPR」个设备像素；在 Retina（DPR 2）上 1080p 会被放大 1.5 倍以上而发虚。
-# 实测同为 3840x2160，指定 w/h 后比原图小 3.3 倍且肉眼看不出画质损失，下载耗时也几乎不变，
-# 所以「取大」几乎没有额外代价。详见模块开头 docstring 的实测表。
-BING_IMAGE_PARAMS = os.getenv("BING_IMAGE_PARAMS", "w=3840&h=2160&c=7&rs=1").strip().lstrip("&?")
+# 默认留空 -> 不追加任何参数 -> 直接取原图（Bing 原始尺寸，可能是 UHD 大图）。
+BING_IMAGE_PARAMS = os.getenv("BING_IMAGE_PARAMS", "").strip().lstrip("&?")
 
 # 磁盘缓存文件名的「盐」：把取图参数拼进 key。
 # 为什么必须有这一层：磁盘缓存原本只按 image_id 命名，一旦改了 BING_IMAGE_PARAMS，
 # 旧文件仍会被命中，新参数永远不生效（表现为「改了参数没反应」）；
 # 若历史上用不同参数跑过，同一个 id 的两种尺寸还会互相覆盖。
 # 加盐后：新参数生成新 key，旧文件变成「孤儿」，会被 LRU 按 mtime 优先淘汰，自愈清理。
+# 注意：原图态（参数为空）也必须有独立盐值，否则历史上缓存过的缩图会被当成原图直接命中，
+# 导致「参数已置空但仍返回缩图」；用固定字面量 "raw" 而非空串，是为了让盐值更直观可读。
 CACHE_KEY_SALT = BING_IMAGE_PARAMS or "raw"
 
 # 是否把缩图参数也用在「原 302 接口」的跳转目标上。
