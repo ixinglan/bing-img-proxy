@@ -109,11 +109,49 @@ curl -i http://localhost:18088/api/bg/health  # {"status":"ok","image_count":N}
 ...以此类推
 ```
 
+### 三个必须同时成立的设计
+
+要让「切换页面零白屏」真正成立，下面三件事缺一不可：
+
+**① 确定性映射 —— 同一 `seed` 永远解析到同一 `image_id`**
+
+如果服务端对同一个 `seed` 每次随机返回不同的图，浏览器的 HTTP 缓存会失去意义
+（缓存的是 URL→响应，会重新取到另一张图），甚至出现「刷新一次背景就变一次」。
+因此 `seed → image_id` 用 `sha256(seed) % len(ids)` 做确定性映射；
+不带 `seed` 时才随机，且此时响应标记为 `no-store`（避免把「随机」冻结成「固定」）。
+
+**② 磁盘缓存有上限 —— LRU 淘汰，文件对数不超过 `CACHE_MAX_FILES`**
+
+`CACHE_MAX_FILES` 是「磁盘最多留几份」的安全上限，**≠** 热池大小 `POOL_SIZE`。
+按 mtime 由旧到新淘汰，但**永不删除**热池中就绪的图与最近返回过的图（它们随时可能被再次命中）。
+该上限是**全局**的：多个 worker 共享同一目录，各自 `listdir` 计数，因此不会被 worker 数放大。
+
+**③ 回源缩图 —— 默认追加 `w/h/c/rs` 参数**
+
+Bing 的 `th` 接口支持按需缩放，不传参数时可能是 UHD 大图。实测（2026-09-16）：
+
+| 图片 | 原图 | 缩到 1920×1080 | 差异 |
+| --- | --- | --- | --- |
+| `OHR.BoatsMalta_..._UHD.jpg` | 3,679,107 字节 / 12.87s | 318,167 字节 / 1.38s | 体积 11.6× / 耗时 9.3× |
+| `OHR.HawaiiLava_..._UHD.jpg` | 3,796,366 字节 / 9.93s | 201,138 字节 / 1.60s | 体积 18.9× / 耗时 6.2× |
+
+对本来就是 1920×1080 的 id 几乎无影响（338KB → 322KB），因此该参数「只赚不亏」。
+
+> **注意**：缩图默认**只作用于新接口 `/api/bg/image`**；原 302 接口的跳转目标保持原样。
+> 若你确认希望 302 也缩图，把 `RESIZE_ON_REDIRECT` 设为 `1`。
+
 验证：
 
 ```bash
 curl -i "http://localhost:18088/api/bg/image?seed=abc"   # 200 + image/webp|jpeg|avif + Cache-Control
-curl -s "http://localhost:18088/api/bg/pool"             # {"pool_size":5,"ready":5}
+curl -s "http://localhost:18088/api/bg/pool"             # 池/缓存状态，含 cache_files 与 cache_max_files
+```
+
+`/api/bg/pool` 返回示例：
+
+```json
+{"pool_size": 5, "ready": 5, "cache_files": 12, "cache_max_files": 20,
+ "resize_params": "w=1920&h=1080&c=7&rs=1"}
 ```
 
 图片缓存落在 `CACHE_DIR`（默认 `cache/`），文件名为 `<sha1(id)>.img` / `<sha1(id)>.type`；
@@ -125,13 +163,16 @@ curl -s "http://localhost:18088/api/bg/pool"             # {"pool_size":5,"ready
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `POOL_ROUTE_PATH` | `/api/bg/image` | 图片池接口路径 |
-| `POOL_SIZE` | `5` | 服务端预留的就绪图片张数 |
+| `POOL_SIZE` | `5` | 服务端预热（常驻）的图片张数 |
 | `CACHE_DIR` | `cache` | 图片磁盘缓存目录（容器内为 `/app/cache`） |
+| `CACHE_MAX_FILES` | `POOL_SIZE*4`（即 `20`） | 磁盘缓存文件对数上限（LRU）；`0` 表示不限制 |
+| `BING_IMAGE_PARAMS` | `w=1920&h=1080&c=7&rs=1` | 回源缩图参数；置空则取原图 |
+| `RESIZE_ON_REDIRECT` | `0` | 是否让原 302 接口也缩图（默认不改动原接口） |
 | `POOL_CACHE_MAX_AGE` | `86400` | 返回给浏览器的缓存秒数（1 天） |
 | `DOWNLOAD_TIMEOUT` | `10` | 回源下载超时秒数 |
 | `UPSTREAM_USER_AGENT` | 内置浏览器 UA | 回源时的 User-Agent |
 
-> 与原接口的关系：`/api/bg/random` **完全保持不变**（仍 302、仍 `no-store`）。新老接口并存。
+> 与原接口的关系：`/api/bg/random` **完全保持不变**（仍 302、仍 `no-store`、跳转目标不带缩图参数）。新老接口并存。
 
 ## 构建镜像
 

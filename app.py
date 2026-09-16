@@ -6,9 +6,22 @@ bing-img-proxy
 
 另提供一个「图片池」接口（默认 /api/bg/image）：
 不做 302 跳转，而是把 Bing 图片的字节直接返回给浏览器，并带强缓存头
-（Cache-Control: public, max-age=...)；服务端预先维护一小批「已下载好」的图片，
-请求时直接从本地磁盘取，取走后立刻在后台线程异步补货，始终保持若干张就绪，
-从而规避「实时回源 Bing 造成的等待」，并让浏览器对图片做本地缓存、实现切换零白屏。
+（Cache-Control: public, max-age=..., immutable）；服务端维护一个小型磁盘缓存 + 热池，
+命中缓存时毫秒级返回，未命中才回源下载，下载完立即在后台补货。
+
+要让「切换菜单不再白屏」真正成立，下面三件事必须同时满足，缺一不可：
+
+  1) 确定性映射：同一个 ?seed= 永远解析到同一个 image_id。
+     前端 URL 因此是稳定的 → 浏览器 HTTP 缓存才能真正命中 → 切换页面 0 请求。
+     （反面教材：服务端若对同一 seed 随机返回不同图，浏览器缓存就失去意义。）
+
+  2) 磁盘缓存有上限：LRU 淘汰，文件对数不超过 CACHE_MAX_FILES。
+     否则随着 ?seed= 的多样性增长，image_ids.txt 里的 id 会被逐个下载并永久留在磁盘上。
+     注意：磁盘上限 ≠ 热池大小。热池 POOL_SIZE 是「预热几张」，磁盘上限是「最多留几份」。
+
+  3) 回源缩图：对新接口默认追加 w/h/c/rs 参数（原 302 接口默认保持原样）。
+     实测（2026-09-16）：UHD 原图 3,679,107 字节 / 12.87s →
+     缩到 1920x1080 后 318,167 字节 / 1.38s，体积约 11.6 倍、耗时约 9.3 倍差异。
 
 配置（均可用环境变量覆盖）：
     CONFIG_DIR          配置目录，容器默认 /app/config
@@ -18,17 +31,21 @@ bing-img-proxy
     ROUTE_PATH          对外「随机重定向」路径，默认 /
 
     POOL_ROUTE_PATH     对外「图片池」路径，默认 /api/bg/image
-    POOL_SIZE           服务端预留的就绪图片数量，默认 5
+    POOL_SIZE           服务端预热（常驻）的图片数量，默认 5
     CACHE_DIR           图片磁盘缓存目录，默认 cache
+    CACHE_MAX_FILES     磁盘缓存文件对数上限（LRU），默认 POOL_SIZE*4（=20）
+                        设为 0 表示不限制（不推荐）
+    BING_IMAGE_PARAMS   回源缩图参数，默认 w=1920&h=1080&c=7&rs=1；置空则取原图
+    RESIZE_ON_REDIRECT  是否让「原 302 接口」也缩图，默认 0（不改动原接口）
     POOL_CACHE_MAX_AGE  返回给浏览器的缓存秒数，默认 86400（1 天）
     DOWNLOAD_TIMEOUT    回源下载超时秒数，默认 10
     UPSTREAM_USER_AGENT 回源时的 User-Agent
 """
 import os
 import hashlib
-import random
 import secrets
 import threading
+import time
 import urllib.request
 from collections import deque
 from contextlib import asynccontextmanager
@@ -43,6 +60,15 @@ IMAGE_IDS_FILE = os.getenv("IMAGE_IDS_FILE", os.path.join(CONFIG_DIR, "image_ids
 ORIGINS_FILE = os.getenv("ORIGINS_FILE", os.path.join(CONFIG_DIR, "origins.txt"))
 BING_BASE_URL = os.getenv("BING_BASE_URL", "https://cn.bing.com/th?id=").rstrip()
 
+# Bing 的 th 接口支持 w/h/c/rs 参数按需缩放：不传就是原始尺寸（可能是 UHD 大图）。
+# 前置的 "&" 由 build_upstream_url 统一拼接，这里只存 "k=v&k=v" 形式。
+BING_IMAGE_PARAMS = os.getenv("BING_IMAGE_PARAMS", "w=1920&h=1080&c=7&rs=1").strip().lstrip("&")
+
+# 是否把缩图参数也用在「原 302 接口」的跳转目标上。
+# 默认关闭：需求明确要求「原 302 接口不动」，缩图只作用于新接口 /api/bg/image。
+# 若你确认想让 302 也缩图（能显著加快线上首屏），把它设为 1 即可。
+RESIZE_ON_REDIRECT = os.getenv("RESIZE_ON_REDIRECT", "0").strip().lower() in {"1", "true", "yes", "on"}
+
 # 处理 ROUTE_PATH 环境变量，确保路径格式规范
 _route = os.getenv("ROUTE_PATH", "/") or "/"
 if not _route.startswith("/"):
@@ -52,6 +78,9 @@ ROUTE_PATH = _route.rstrip("/") if _route != "/" else "/"
 # ---------- 图片池相关配置 ----------
 POOL_SIZE = max(1, int(os.getenv("POOL_SIZE", "5")))
 CACHE_DIR = os.getenv("CACHE_DIR", "cache")
+# 磁盘缓存上限：默认给热池的 4 倍，既留足余量给「访客各自 seed 映射到的图」，
+# 又能保证淘汰逻辑有空隙可做（protected 数量必须小于 cap，否则永远淘汰不动）。
+CACHE_MAX_FILES = int(os.getenv("CACHE_MAX_FILES", str(POOL_SIZE * 4)))
 POOL_CACHE_MAX_AGE = int(os.getenv("POOL_CACHE_MAX_AGE", "86400"))
 DOWNLOAD_TIMEOUT = float(os.getenv("DOWNLOAD_TIMEOUT", "10"))
 UPSTREAM_USER_AGENT = os.getenv(
@@ -59,6 +88,8 @@ UPSTREAM_USER_AGENT = os.getenv(
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 )
+# 残留 .tmp 文件的清理阈值（秒）：进程被 kill 时可能留下写了一半的临时文件
+TMP_TTL_SECONDS = 600
 
 # 处理 POOL_ROUTE_PATH 环境变量，确保路径格式规范
 _pool_route = os.getenv("POOL_ROUTE_PATH", "/api/bg/image") or "/api/bg/image"
@@ -68,13 +99,26 @@ POOL_ROUTE_PATH = _pool_route.rstrip("/") or "/api/bg/image"
 
 
 # ---------- 回源下载 ----------
+def build_upstream_url(img_id: str, resize: bool = True) -> str:
+    """拼出回源 URL。
+
+    img_id 里可能带点号、下划线、连字符，但不会有 "?"，所以这里用 "&" 直接续参数即可。
+
+    resize=False 时不追加缩图参数（用于「原 302 接口保持完全不变」的场景）。
+    """
+    url = f"{BING_BASE_URL}{img_id}"
+    if resize and BING_IMAGE_PARAMS:
+        url = f"{url}&{BING_IMAGE_PARAMS}"
+    return url
+
+
 def download_image(img_id: str) -> tuple[bytes, str] | None:
     """回源下载一张 Bing 图片。
 
     成功返回 (图片字节, content-type)；任何失败（超时/网络异常/上游非 2xx/空响应）
     都返回 None，交由调用方决定是否重试。只用标准库 urllib，避免引入额外依赖。
     """
-    url = f"{BING_BASE_URL}{img_id}"
+    url = build_upstream_url(img_id)
     req = urllib.request.Request(
         url,
         headers={
@@ -146,24 +190,44 @@ class ConfigLoader:
 loader = ConfigLoader(IMAGE_IDS_FILE, ORIGINS_FILE)
 
 
+def pick_image_id(seed: str | None) -> str | None:
+    """把一个 seed 解析成 image_id（确定性）。
+
+    - 带 seed：用 sha256 取模，同一 seed 永远落到同一个 id → 前端 URL 稳定 → 浏览器可缓存。
+    - 不带 seed：随机取一个（此时响应会标记为 no-store，避免「随机结果被缓存成固定图」）。
+
+    id 列表为空时返回 None，由调用方转成 503。
+    """
+    ids = loader.image_ids
+    if not ids:
+        return None
+    if seed:
+        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+        return ids[int(digest, 16) % len(ids)]
+    return secrets.choice(ids)
+
+
 # ---------- 图片池 ----------
 class ImagePool:
-    """服务端图片池：让「返回图片字节」的请求直接从本地取，规避回源延迟。
+    """服务端图片缓存：让「返回图片字节」的请求直接从本地取，规避回源延迟。
 
     三个组成部分：
       1. 磁盘缓存：<CACHE_DIR>/<sha1(id)>.img 存图片字节、<sha1(id)>.type 存 content-type。
          同一 id 的内容固定，可长期复用；多个 gunicorn worker 之间共享同一份磁盘缓存，
          进程重启后也依然命中（不需要重新回源）。
-      2. 内存池  ：每个 worker 进程各自维护一个「就绪 id」队列 deque，长度上限 POOL_SIZE。
+         文件对数由 CACHE_MAX_FILES 做 LRU 上限，避免无限增长。
+      2. 热池    ：每个 worker 进程各自维护一个「已就绪 id」队列 deque，长度上限 POOL_SIZE。
          worker 之间不共享内存，但共享磁盘，所以任一 worker 下过的图，另一个也能直接命中。
-      3. 补货    ：每取走一张就立即在后台线程补一张，使池恢复到 POOL_SIZE。
+      3. 补货    ：每取走一张就立即在后台线程补一张，使热池恢复到 POOL_SIZE。
          即用户要的「取 1 张 → 剩 4 张 → 异步补 1 张 → 又是 5 张」效果。
     """
 
-    def __init__(self, cache_dir: str, size: int):
+    def __init__(self, cache_dir: str, size: int, max_files: int):
         self.cache_dir = cache_dir
         self.size = max(1, int(size))
+        self.cache_max_files = max(0, int(max_files))
         self._lock = threading.Lock()
+        self._evict_lock = threading.Lock()  # 淘汰过程串行化，避免并发 listdir/remove 打架
         self._ready: deque[str] = deque()   # 已就绪（本地可取）的 image_id
         self._inflight: set[str] = set()    # 正在下载中的 image_id，避免重复下载
         self._recent: deque[str] = deque(maxlen=max(1, int(size)))  # 最近返回过的 id，避免短期重复
@@ -175,9 +239,20 @@ class ImagePool:
         with self._lock:
             return len(self._ready)
 
+    def cache_file_count(self) -> int:
+        """当前磁盘缓存里已落盘的图片份数（用于运维观测 LRU 上限是否生效）。"""
+        try:
+            return sum(1 for n in os.listdir(self.cache_dir) if n.endswith(".img"))
+        except OSError:
+            return 0
+
     # ----- 磁盘缓存 -----
+    def _key(self, img_id: str) -> str:
+        """image_id -> 缓存文件名主干（sha1，规避路径注入与超长文件名）。"""
+        return hashlib.sha1(img_id.encode("utf-8")).hexdigest()
+
     def _cache_paths(self, img_id: str) -> tuple[str, str]:
-        key = hashlib.sha1(img_id.encode("utf-8")).hexdigest()
+        key = self._key(img_id)
         return (
             os.path.join(self.cache_dir, key + ".img"),
             os.path.join(self.cache_dir, key + ".type"),
@@ -195,6 +270,66 @@ class ImagePool:
         except OSError:
             pass
         return data_path, ctype
+
+    # ----- 磁盘上限（LRU 淘汰） -----
+    def _evict_if_needed(self, protect: set[str] | None = None) -> None:
+        """把磁盘缓存的文件对数压回 CACHE_MAX_FILES 以内。
+
+        淘汰策略：按 mtime 由旧到新删除，但**永不删除**下面两类：
+          - 热池中已就绪的 id（_ready）：它们随时会被下一个请求命中；
+          - 最近返回过的 id（_recent）：访客刚看过的图，马上可能再来；
+          - 调用方显式传入的 protect（通常是「本次刚写完的那张」）。
+        删除时 .img 与 .type 成对删除，避免留下孤儿 meta 文件。
+        同时顺手清理超过 TMP_TTL_SECONDS 的残留 .tmp（进程被 kill 时的遗留物）。
+        """
+        with self._evict_lock:
+            try:
+                names = os.listdir(self.cache_dir)
+            except OSError:
+                return
+
+            # 1) 清理残留临时文件
+            now = time.time()
+            for n in names:
+                if not n.endswith(".tmp"):
+                    continue
+                p = os.path.join(self.cache_dir, n)
+                try:
+                    if now - os.path.getmtime(p) > TMP_TTL_SECONDS:
+                        os.remove(p)
+                except OSError:
+                    pass
+
+            if self.cache_max_files <= 0:
+                return  # 0 表示不限制
+
+            keys = {n[:-4] for n in names if n.endswith(".img")}
+            if len(keys) <= self.cache_max_files:
+                return
+
+            with self._lock:
+                hot = set(self._ready) | set(self._recent)
+            protected = {self._key(i) for i in hot}
+            if protect:
+                protected |= protect
+
+            # 只统计「可淘汰」的，按 mtime 升序（最旧在前）
+            evictable: list[tuple[float, str]] = []
+            for k in keys - protected:
+                p = os.path.join(self.cache_dir, k + ".img")
+                try:
+                    evictable.append((os.path.getmtime(p), k))
+                except OSError:
+                    continue
+            evictable.sort()
+
+            need = len(keys) - self.cache_max_files
+            for _, k in evictable[:need]:
+                for suffix in (".img", ".type"):
+                    try:
+                        os.remove(os.path.join(self.cache_dir, k + suffix))
+                    except OSError:
+                        pass
 
     def _ensure_cached(self, img_id: str) -> tuple[str, str] | None:
         """确保该 id 的图片已落盘（命中则直接用，否则回源下载并原子写入）。"""
@@ -219,13 +354,34 @@ class ImagePool:
             except OSError:
                 pass
             return None
+        # 写盘成功后立刻做一次上限检查；protect 保证「刚写好的这张」不会被自己淘汰掉
+        self._evict_if_needed(protect={self._key(img_id)})
         return data_path, ctype
+
+    # ----- 取图（按 id，确定性） -----
+    def get(self, img_id: str) -> tuple[str, str, str] | None:
+        """取指定 id 的图片。
+
+        命中磁盘缓存 → 毫秒级返回；未命中 → 同步回源下载一张再返回（首次访问才会走到）。
+        返回 (本地路径, content-type, image_id)。
+        """
+        # 若该 id 恰好在热池里，先把它取出（它马上要被消费掉，由 refill 再补上）
+        with self._lock:
+            try:
+                self._ready.remove(img_id)
+            except ValueError:
+                pass
+        hit = self._ensure_cached(img_id)
+        if hit is None:
+            return None
+        self._mark_recent(img_id)
+        return hit[0], hit[1], img_id
 
     # ----- 补货 -----
     def _candidates(self) -> list[str]:
         """可用于补货的候选 id。
 
-        优先选「不在池里、不在下载中、也不在最近返回列表里」的，尽量避免短期重复；
+        优先选「不在热池里、不在下载中、也不在最近返回列表里」的，尽量避免短期重复；
         若候选被穷尽，则逐级放宽条件，保证始终返回非空候选（除非 id 列表本身为空）。
         """
         ids = loader.image_ids
@@ -264,7 +420,7 @@ class ImagePool:
         return True
 
     def refill(self) -> None:
-        """把池补到 POOL_SIZE。
+        """把热池补到 POOL_SIZE。
 
         每轮并发补若干张（最多 3 张），加快冷启动预热；带尝试上限，
         避免个别 id 长期下载失败时死循环。
@@ -303,45 +459,13 @@ class ImagePool:
 
         threading.Thread(target=_job, name="pool-refill", daemon=True).start()
 
-    # ----- 取图 -----
+    # ----- 辅助 -----
     def _mark_recent(self, img_id: str) -> None:
         with self._lock:
             self._recent.append(img_id)
 
-    def acquire(self) -> tuple[str, str, str] | None:
-        """取一张图片。
 
-        返回 (本地路径, content-type, image_id)；池空（冷启动或并发高峰）时同步下载一张兜底。
-        """
-        # 快路径：池里已有现成的，直接拿走（这就是「从缓存拿」的秒回路径）
-        for _ in range(8):
-            with self._lock:
-                img_id = self._ready.popleft() if self._ready else None
-            if img_id is None:
-                break
-            hit = self._cached(img_id)
-            if hit:
-                self._mark_recent(img_id)
-                return hit[0], hit[1], img_id
-            # 缓存文件被外部清掉了：丢弃该 id，继续从池里取下一张
-
-        # 慢路径：池空 → 同步下载一张兜底（只有冷启动/首次才会走到这里）
-        candidates = self._candidates()
-        random.shuffle(candidates)
-        for img_id in candidates[:3]:
-            hit = self._ensure_cached(img_id)
-            if hit:
-                with self._lock:
-                    self._recent.append(img_id)
-                    try:
-                        self._ready.remove(img_id)
-                    except ValueError:
-                        pass
-                return hit[0], hit[1], img_id
-        return None
-
-
-pool = ImagePool(CACHE_DIR, POOL_SIZE)
+pool = ImagePool(CACHE_DIR, POOL_SIZE, CACHE_MAX_FILES)
 
 
 # ---------- 来源校验 ----------
@@ -377,10 +501,19 @@ def origin_allowed(request_origin: str | None, whitelist: list[str]) -> bool:
     return False
 
 
+def check_origin(request: Request) -> None:
+    """白名单校验，不通过直接 403。"""
+    req_origin = get_request_origin(
+        request.headers.get("referer"), request.headers.get("origin")
+    )
+    if not origin_allowed(req_origin, loader.origins):
+        raise HTTPException(status_code=403, detail="origin not allowed")
+
+
 # ---------- 应用 ----------
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # 启动时后台预热图片池（不阻塞启动；预热失败也无妨，首个请求会兜底同步下载）
+    # 启动时后台预热热池（不阻塞启动；预热失败也无妨，首个请求会兜底同步下载）
     pool.refill_async()
     yield
 
@@ -395,31 +528,29 @@ def health() -> dict:
 
 @app.get("/api/bg/pool")
 def pool_status() -> dict:
-    """图片池状态，便于运维观测当前 worker 里有多少张已就绪。"""
-    return {"pool_size": pool.size, "ready": pool.ready_count()}
+    """图片池与磁盘缓存状态，便于运维观测（无需进容器即可核对 LRU 上限是否生效）。"""
+    return {
+        "pool_size": pool.size,
+        "ready": pool.ready_count(),
+        "cache_files": pool.cache_file_count(),
+        "cache_max_files": pool.cache_max_files,
+        "resize_params": BING_IMAGE_PARAMS,
+    }
 
 
 def handle_random(request: Request) -> RedirectResponse:
     if not loader.image_ids:
         raise HTTPException(status_code=503, detail="no image ids configured")
 
-    req_origin = get_request_origin(
-        request.headers.get("referer"), request.headers.get("origin")
-    )
-    if not origin_allowed(req_origin, loader.origins):
-        raise HTTPException(status_code=403, detail="origin not allowed")
+    check_origin(request)
 
-    # 若携带 seed 则确定性选图：同一 seed 永远映射到同一张图（用于前端缓存背景，
-    # 只在用户点击「刷新背景」时换 seed），否则保持原有随机行为。
-    seed = request.query_params.get("seed")
-    ids = loader.image_ids
-    if seed:
-        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
-        img_id = ids[int(digest, 16) % len(ids)]
-    else:
-        img_id = secrets.choice(ids)
+    # 若携带 seed 则确定性选图（同一 seed 永远映射到同一张图）；否则保持原有随机行为。
+    # 注意：本接口是 302 跳转，响应本身仍标 no-store，行为与改造前完全一致。
+    img_id = pick_image_id(request.query_params.get("seed"))
+    if img_id is None:
+        raise HTTPException(status_code=503, detail="no image ids configured")
 
-    url = f"{BING_BASE_URL}{img_id}"
+    url = build_upstream_url(img_id, resize=RESIZE_ON_REDIRECT)
     # 防缓存：每次都随机，不被浏览器 / CDN 缓存
     return RedirectResponse(
         url,
@@ -433,34 +564,36 @@ def handle_pool_image(request: Request) -> FileResponse:
 
     与原 302 接口的区别：
       - 响应体是图片本身（同源），可被浏览器磁盘缓存；
-      - URL 稳定（前端按 seed 生成）→ 切换菜单命中浏览器缓存，不再回源，从而消除白屏。
+      - URL 与图片一一对应（seed 决定 id）→ 切换菜单命中浏览器缓存，不再回源，从而消除白屏。
     """
     if not loader.image_ids:
         raise HTTPException(status_code=503, detail="no image ids configured")
 
-    req_origin = get_request_origin(
-        request.headers.get("referer"), request.headers.get("origin")
-    )
-    if not origin_allowed(req_origin, loader.origins):
-        raise HTTPException(status_code=403, detail="origin not allowed")
+    check_origin(request)
 
-    picked = pool.acquire()
+    seed = request.query_params.get("seed")
+    img_id = pick_image_id(seed)
+    if img_id is None:
+        raise HTTPException(status_code=503, detail="no image ids configured")
+
+    picked = pool.get(img_id)
     if picked is None:
         raise HTTPException(status_code=502, detail="failed to fetch image from upstream")
-    path, ctype, img_id = picked
+    path, ctype, real_id = picked
 
-    # 取走一张后立刻异步补一张，使池恢复到 POOL_SIZE（对前端表现为「秒回」）
+    # 取走一张后立刻异步补货，使热池恢复到 POOL_SIZE（对前端表现为「秒回」）
     pool.refill_async()
 
-    return FileResponse(
-        path,
-        media_type=ctype,
-        headers={
-            # 强缓存 1 天：同一 seed 的 URL 在浏览器端直接命中，不再回源 → 切换零延迟
-            "Cache-Control": f"public, max-age={POOL_CACHE_MAX_AGE}, immutable",
-            "X-Bing-Image-Id": img_id,
-        },
-    )
+    headers = {"X-Bing-Image-Id": real_id}
+    if seed:
+        # 带 seed → URL 与图片一一对应，可以放心强缓存：
+        # 同一 seed 的 URL 在浏览器端直接命中，不再回源 → 切换菜单零延迟。
+        headers["Cache-Control"] = f"public, max-age={POOL_CACHE_MAX_AGE}, immutable"
+    else:
+        # 不带 seed → 每次都是随机图，URL 却稳定，若允许缓存会把「随机」冻结成「固定」。
+        headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+
+    return FileResponse(path, media_type=ctype, headers=headers)
 
 
 app.add_api_route(ROUTE_PATH, handle_random, methods=["GET"])
